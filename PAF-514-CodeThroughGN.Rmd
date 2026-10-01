@@ -1,0 +1,226 @@
+---
+title: "Merging Crime and Foreclosure Datasets with dyplr"
+author: "Genesis Navarrete"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    theme: darkly
+    df_print: paged
+    highlight: tango
+    toc: yes
+    toc_float: yes
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set( echo = TRUE, message=F, warning=F )
+```
+
+# Introduction 
+
+The dplyr package is part of the tidyverse in R and provides functions for transforming data, including filtering rows, selecting columns, creating variables, and summarizing information. These tools help prepare datasets for analysis. In this code-through, we will focus on using dplyr to merge two datasets through joins, which match observations using one or more key variables, such as an ID. Functions such as left_join(), inner_join(), right_join(), and full_join() combine information from two datasets while determining which observations are retained. Understanding these differences helps us choose the appropriate join for our analysis. 
+Objective: Data scientist will combine two datasets using a shared census tract ID and using a left join. 
+
+
+# Part I 
+
+## Required Packages
+
+```{r}
+library( dplyr )
+library( pander )
+library(sf)
+library(tigris)
+```
+
+
+
+## Load Datasets 
+
+Next, we will combine two datasets containing 2024 crime counts and foreclosure counts by census tract in the City of Los Angeles. The crime counts will be based on 2024 records from the City’s Crime Data from 2020 to 2024 dataset. Using dplyr, we will join the datasets by their shared census tract identifier, bringing crime and foreclosure counts together in one table. This example demonstrates how joins can combine information from separate sources for analysis.
+```{r}
+crime.data <- read.csv("Crime_Data_from_2020_to_2024_20260930.csv")
+foreclosures_data1 <- read.csv("All Years Foreclosures Calculations_c (1).csv")
+
+
+head(crime.data)
+head(foreclosures_data1)
+```
+
+![Los Angeles City (Does not reflect the datasets we are using)](https://datasmart.hks.harvard.edu/sites/g/files/omnuum10826/files/2025-06/LA%20Pub%20Safety%20map.png)
+
+
+## Cleaning Data 
+
+Before merging we must clean the data and make sure that both datasets represent the same year and geographic unit so that their counts are comparable. We select 2024 from each dataset to align the time period and use census tracts as the shared geographic unit. In the foreclosure data, we format 'geoid20' as an 11-digit identifier, preserving leading zeros, and retain the tract ID, year, and foreclosure count. In the crime data, we create a record identifier, extract the year from 'DATE.OCC', and keep only 2024 records. 
+
+Next, we will assign crime records to census tracts using their locations and count the records within each tract. 
+
+```{r}
+foreclosures.2024 <- foreclosures_data1 %>%
+  filter(year == 2024) %>%
+  mutate(geoid20 = sprintf("%011.0f", geoid20)) %>%
+  select(geoid20, year, foreclosures_count)
+
+
+crime.2024 <- crime.data %>%
+  mutate(
+    record_id = row_number(),
+    year = as.integer(substr(DATE.OCC, 1, 4))
+  ) %>%
+  filter(year == 2024)
+
+```
+
+We test run and make sure that tract IDs use the same format in both datasets so they can match correctly during the join.
+```{r}
+#test run 
+nrow(crime.2024)
+```
+
+## Missing Data 
+Not all datacollection is perfect we will eventually encounter missing data points. Therefore before assigning crimes to census tracts, we retain records with non missing coordinates that fall within the latitude and longitude for Los Angeles. The following code removes records with missing values, zero coordinates, or values outside the LAT and LONG ranges and stores the remaining records in crime.valid. This helps us  prepare the data for geographic matching. 
+```{r}
+crime.valid <- crime.2024 %>%
+  filter(
+    !is.na(LAT),
+    !is.na(LON),
+    LAT > 0, LAT <= 90,
+    LON >= -180, LON < 0
+  )
+```
+
+
+```{r}
+#test run
+nrow(crime.2024) - nrow(crime.valid)
+```
+
+## Download Los Angeles County census tract boundaries
+
+Must need Internet connection for this 
+
+The tigris package downloads geographic boundary data from the U.S. Census Bureau directly into R, making it easier to work with areas such as states, counties, and census tracts. Here, tigris::tracts() retrieves the 2024 census tract boundaries for Los Angeles City, California, with cb = FALSE requesting detailed TIGER/Line boundaries. We then use transmute() to retain the tract identifier as a character variable named geoid20, along with the spatial geometry. 
+
+Finally, st_transform() converts the boundaries to the WGS84 LAT and LONG  coordinate system so they can be aligned with crime locations using that same system. This prepares the boundaries for assigning 2024 crime records to 2024 census tracts.
+
+```{r}
+la.tracts <- tigris::tracts(
+  state = "CA",
+  county = "Los Angeles",
+  year = 2020,
+  cb = FALSE
+)
+
+la.tracts <- la.tracts %>%
+  transmute(geoid20 = as.character(GEOID)) %>%
+  st_transform(4326)
+```
+
+The sf package stands for: simple features. Sf provides tools for working with geographic data in R, including points representing crime locations and polygons representing census tract boundaries. We use st_join() function to combine information based on geographic relationships. Specifically, join = st_within matches crime points to the census tracts containing them and attaches the corresponding tract information. 
+
+Setting left = TRUE keeps all crime records, including unmatched points, which receive NA values for the tract information. This inspects unmatched records before calculating crime counts by census tract.
+
+```{r}
+crime.points <- crime.valid %>%
+  select(record_id, year, LON, LAT) %>%
+  st_as_sf(
+    coords = c("LON", "LAT"),
+    crs = 4326
+  )
+
+crime.with.tracts <- st_join(
+  crime.points,
+  la.tracts,
+  join = st_within,
+  left = TRUE
+)
+
+```
+
+```{r}
+# test run chack 
+sum(is.na(crime.with.tracts$geoid20))
+```
+If returns 0 we continue 
+
+```{r}
+stopifnot(
+  !anyDuplicated(crime.with.tracts$record_id)
+)
+```
+
+# Part II 
+
+## Match 
+After assigning crime records to census tracts, we summarize them to create one row for each tract with matched crime records in 2024. 
+
+First, st_drop_geometry() removes the spatial geometry because we only need the table for counting and merging. 
+
+Next, filter(!is.na(geoid20)) excludes records that were not assigned to a tract. The count() function groups the remaining records by tract ID and year and stores the number of records in crime_count. 
+
+Finally, head() displays the first six rows so we can inspect the summary before joining it to the foreclosure counts.
+```{r}
+crime.counts <- crime.with.tracts %>%
+  st_drop_geometry() %>%
+  filter(!is.na(geoid20)) %>%
+  count(geoid20, year, name = "crime_count")
+
+head(crime.counts)
+```
+## Merge 
+
+The final step combines the 2024 foreclosure and crime counts using census tract ID (geoid20) and year as matching keys. We first prepare the foreclosure data and verify that each tract-year combination appears only once. Then, left_join() keeps every row in foreclosures.2024 and adds crime_count wherever the tract ID and year match. Setting relationship = "one-to-one" checks that neither dataset has multiple rows matching a row in the other dataset. If a foreclosure tract has no match in crime.counts, its crime count appears as NA, meaning no matching crime summary was found; this does not automatically establish that the tract had zero crimes. Finally, head() displays the first six rows of the merged dataset for inspection.
+
+```{r}
+foreclosures.2024 <- foreclosures_data1 %>%
+  filter(year == 2024) %>%
+  mutate(geoid20 = sprintf("%011.0f", geoid20)) %>%
+  select(geoid20, year, foreclosures_count)
+
+# Verify that each foreclosure tract-year occurs once
+stopifnot(
+  !anyDuplicated(
+    foreclosures.2024[c("geoid20", "year")]
+  )
+)
+
+merged.left <- foreclosures.2024 %>%
+  left_join(
+    crime.counts,
+    by = c("geoid20", "year"),
+    relationship = "one-to-one"
+  )
+
+head(merged.left)
+```
+
+The merged output brings together foreclosure and crime counts for each tract-year in foreclosures.2024, using census tract ID and year to match rows in crime.counts. For example, the first displayed row shows that tract 06037101110 had 0 foreclosures and 62 matched crime records in 2024. A foreclosure tract without a matching crime-count row remains in the output with NA for crime_count. A left join fits this goal because we want to retain all tracts in the foreclosure dataset while adding available crime counts while other join types retain different sets of observations and serve different analytical goals.
+
+Each join retains a different set of observations. 
+
+A left join keeps every tract-year in the foreclosure dataset and adds matching crime counts, making it appropriate when the foreclosure dataset defines the study sample. 
+
+An inner join keeps only tract-years found in both datasets, which is useful when analyzing matched observations after checking what was excluded. 
+
+A full outer join keeps every tract-year appearing in either dataset, allowing us to examine their combined coverage. 
+
+A right join keeps every tract-year in the crime-count dataset and adds matching foreclosure counts, making it appropriate when the crime-count dataset defines the study sample.
+
+
+# References 
+
+1. https://la.myneighborhooddata.org/2021/06/foreclosures/
+2. https://data.lacity.org/Public-Safety/Crime-Data-from-2020-to-2024/2nrs-mtv8/about_data
+3. https://datasmart.hks.harvard.edu/sites/g/files/omnuum10826/files/2025-06/LA%20Pub%20Safety%20map.png (image)
+4. https://ds4ps.org/dp4ss-textbook/p-076-merging-data.html
+5. https://ds4ps.org/dp4ss/#one-dimensional-datasets
+6. https://r-spatial.github.io/sf/reference/st_join.html 
+7. https://dplyr.tidyverse.org/reference/mutate-joins.html 
+8. https://r-spatial.github.io/sf/reference/st_join.html 
+9. https://walker-data.com/census-r/census-geographic-data-and-applications-in-r.html 
+10. https://r4ds.hadley.nz/data-transform 
+
+
+
+
